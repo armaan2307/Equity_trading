@@ -1,5 +1,6 @@
-streamlit
+fastapi
+uvicorn[stansdard]
 pandas
-numpy<2
+numpy
 yfinance
-sqlite3
+requests
