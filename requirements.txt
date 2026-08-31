@@ -1,5 +1,5 @@
 fastapi
-uvicorn[stansdard]
+uvicorn[standard]
 pandas
 numpy
 yfinance
