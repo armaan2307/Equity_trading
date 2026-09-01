@@ -24,25 +24,38 @@ def get_indices():
         "NIFTY 50": "^NSEI",
         "BANK NIFTY": "^NSEBANK",
         "SENSEX": "^BSESN",
-        "NIFTY MIDCAP": "^NSEMDCP50"
+        "NIFTY MIDCAP": "NIFTY_MIDCAP_100.NS"
     }
     payload = []
     for name, ticker in indices.items():
         try:
-            data = yf.Ticker(ticker).history(period="5d")
-            if len(data) >= 2:
-                last_price = float(data['Close'].iloc[-1])
-                prev_price = float(data['Close'].iloc[-2])
-                change_pts = last_price - prev_price
-                change_pct = (change_pts / prev_price) * 100
-                payload.append({
-                    "name": name,
-                    "price": round(last_price, 2),
-                    "change_pts": round(change_pts, 2),
-                    "change_pct": round(change_pct, 2)
-                })
+            t = yf.Ticker(ticker)
+            # 1. Fetch real-time price from fast_info
+            last_price = t.fast_info.get("lastPrice")
+            prev_close = t.fast_info.get("previousClose")
+
+            # 2. Fallback to 2-day history if fast_info is unavailable
+            if not last_price or not prev_close:
+                hist = t.history(period="2d", interval="1d")
+                if len(hist) >= 2:
+                    last_price = float(hist['Close'].iloc[-1])
+                    prev_close = float(hist['Close'].iloc[-2])
+                elif len(hist) == 1:
+                    last_price = float(hist['Close'].iloc[-1])
+                    prev_close = last_price
+
+            change_pts = last_price - prev_close
+            change_pct = (change_pts / prev_close) * 100 if prev_close else 0.0
+
+            payload.append({
+                "name": name,
+                "price": round(float(last_price), 2),
+                "change_pts": round(float(change_pts), 2),
+                "change_pct": round(float(change_pct), 2)
+            })
         except Exception:
             continue
+
     return payload
 
 @app.get("/api/trades/{timeframe}")
