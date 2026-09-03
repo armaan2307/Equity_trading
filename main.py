@@ -18,6 +18,13 @@ app.add_middleware(
 
 DB_NAME = "trade_lifecycle.db"
 
+# Robust fallback pools to keep tables populated even after Render cold restarts
+FALLBACK_UNIVERSE = {
+    "intraday": ["TATAMOTORS", "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "BHARTIARTL", "LT", "AXISBANK", "MARUTI"],
+    "swing": ["TRENT", "BEL", "HAL", "CHOLAFIN", "MCX", "ZOMATO", "KALYANKJIL", "AMBER", "AEGISCHEM", "DLF"],
+    "longterm": ["LTIM", "TITAN", "SUNPHARMA", "TCS", "ASIANPAINT", "BAJFINANCE", "NTPC", "COALINDIA", "JIOFIN", "POWERGRID"]
+}
+
 @app.get("/api/indices")
 def get_indices():
     indices = {
@@ -30,11 +37,9 @@ def get_indices():
     for name, ticker in indices.items():
         try:
             t = yf.Ticker(ticker)
-            # 1. Fetch real-time price from fast_info
             last_price = t.fast_info.get("lastPrice")
             prev_close = t.fast_info.get("previousClose")
 
-            # 2. Fallback to 2-day history if fast_info is unavailable
             if not last_price or not prev_close:
                 hist = t.history(period="2d", interval="1d")
                 if len(hist) >= 2:
@@ -60,48 +65,95 @@ def get_indices():
 
 @app.get("/api/trades/{timeframe}")
 def get_trades(timeframe: str):
+    tf = timeframe.lower().strip()
     table_map = {
         "intraday": "intraday_trades",
         "swing": "swing_trades",
         "longterm": "longterm_trades"
     }
-    table = table_map.get(timeframe.lower())
+    table = table_map.get(tf)
     if not table:
         raise HTTPException(status_code=404, detail="Invalid timeframe specified.")
 
-    conn = sqlite3.connect(DB_NAME)
+    records = []
+    
+    # 1. Read from SQLite if data exists
     try:
-        df = pd.read_sql(f"SELECT * FROM {table} WHERE status = 'ACTIVE'", conn)
-    except Exception:
-        df = pd.DataFrame()
-    finally:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql(f"SELECT * FROM {table} WHERE status = 'ACTIVE' LIMIT 10", conn)
         conn.close()
+        if not df.empty:
+            for col in ["category", "rsi"]:
+                if col in df.columns:
+                    df = df.drop(columns=[col])
+            records = df.to_dict(orient="records")
+    except Exception:
+        records = []
 
-    if df.empty:
-        return []
+    # 2. Live On-the-Fly Generator if SQLite is empty
+    if not records:
+        symbols = FALLBACK_UNIVERSE.get(tf, FALLBACK_UNIVERSE["intraday"])
+        symbols_ns = [f"{s}.NS" for s in symbols]
+        try:
+            batch = yf.download(symbols_ns, period="5d", interval="1d", group_by="ticker", progress=False, threads=True)
+        except Exception:
+            batch = None
 
-    for col in ["category", "rsi"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
+        for sym in symbols:
+            try:
+                df_sym = batch[f"{sym}.NS"] if batch is not None and f"{sym}.NS" in batch else yf.Ticker(f"{sym}.NS").history(period="5d", interval="1d")
+                df_sym = df_sym.dropna()
+                cmp_val = round(float(df_sym['Close'].iloc[-1]), 2)
+                high = float(df_sym['High'].iloc[-1])
+                low = float(df_sym['Low'].iloc[-1])
+                vol = (high - low) if (high - low) > 0 else (cmp_val * 0.015)
+            except Exception:
+                continue
 
-    records = df.to_dict(orient="records")
+            if tf == "intraday":
+                entry = round(cmp_val * 0.998, 2)
+                target = round(cmp_val + (1.5 * vol), 2)
+                stop_loss = round(cmp_val - (1.0 * vol), 2)
+            elif tf == "swing":
+                entry = round(cmp_val * 0.992, 2)
+                target = round(cmp_val + (3.0 * vol), 2)
+                stop_loss = round(cmp_val - (1.8 * vol), 2)
+            else:
+                entry = round(cmp_val * 0.985, 2)
+                target = round(cmp_val * 1.25, 2)
+                stop_loss = round(cmp_val * 0.90, 2)
+
+            ret = round(((cmp_val - entry) / entry) * 100, 2)
+            records.append({
+                "symbol": sym,
+                "entry": entry,
+                "current_price": cmp_val,
+                "target": target,
+                "stop_loss": stop_loss,
+                "return_pct": ret
+            })
+        return records[:10]
+
+    # 3. Synchronize DB records with fast live quotes
     for row in records:
         sym = row.get("symbol")
         if sym:
             sym_ticker = f"{sym}.NS" if not sym.endswith(".NS") else sym
             try:
-                hist = yf.Ticker(sym_ticker).history(period="2d")
-                if not hist.empty:
-                    cmp = float(hist['Close'].iloc[-1])
-                    row["current_price"] = round(cmp, 2)
-                    entry = float(row.get("entry", 0))
-                    if entry > 0:
-                        row["return_pct"] = round(((cmp - entry) / entry) * 100, 2)
+                t = yf.Ticker(sym_ticker)
+                cmp_val = t.fast_info.get("lastPrice")
+                if not cmp_val:
+                    hist = t.history(period="1d")
+                    cmp_val = float(hist['Close'].iloc[-1]) if not hist.empty else row.get("entry", 0)
+                row["current_price"] = round(float(cmp_val), 2)
+                entry = float(row.get("entry", 0))
+                if entry > 0:
+                    row["return_pct"] = round(((float(cmp_val) - entry) / entry) * 100, 2)
             except Exception:
                 row["current_price"] = row.get("entry", 0)
+
     return records
 
-# Dynamic Live Autocomplete Search for Any Indian Stock
 @app.get("/api/stock/search")
 def search_stocks(q: str):
     if not q or len(q.strip()) < 2:
@@ -110,7 +162,6 @@ def search_stocks(q: str):
     clean_query = q.strip()
     results = []
 
-    # 1. Query Yahoo Finance Search API directly for real-time ticker lookup
     try:
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={clean_query}&quotesCount=10&newsCount=0"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -121,7 +172,6 @@ def search_stocks(q: str):
             for item in quotes:
                 symbol = item.get("symbol", "")
                 name = item.get("shortname") or item.get("longname") or symbol
-                # Filter for Indian NSE / BSE instruments or clean symbols
                 if symbol.endswith(".NS") or symbol.endswith(".BO") or not "." in symbol:
                     clean_sym = symbol.replace(".NS", "").replace(".BO", "")
                     results.append({
@@ -132,7 +182,6 @@ def search_stocks(q: str):
     except Exception:
         pass
 
-    # Fallback to direct symbol match if no API results returned
     if not results:
         results.append({
             "name": clean_query.upper(),
@@ -140,7 +189,6 @@ def search_stocks(q: str):
             "exchange": "NSE"
         })
 
-    # Return top 8 unique matches
     seen = set()
     unique_results = []
     for r in results:
@@ -223,7 +271,6 @@ def get_stock_deep_analysis(symbol: str):
     low_prev = float(hist["Low"].iloc[-2]) if len(hist) > 1 else float(hist["Low"].iloc[-1])
     close_prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else close
     
-    # Technical Pivots
     pivot = (high_prev + low_prev + close_prev) / 3
     r1 = (2 * pivot) - low_prev
     r2 = pivot + (high_prev - low_prev)
@@ -236,7 +283,6 @@ def get_stock_deep_analysis(symbol: str):
     ema_20 = float(hist["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
     ema_50 = float(hist["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
     
-    # Safe Fundamentals Extraction
     info = {}
     try:
         info = ticker.info or {}
@@ -255,11 +301,9 @@ def get_stock_deep_analysis(symbol: str):
     roce = f"{round(info.get('returnOnAssets', 0) * 100, 2)}%" if info.get("returnOnAssets") else "--"
     dividend_yield = f"{round(info.get('dividendYield', 0) * 100, 2)}%" if info.get("dividendYield") else "--"
 
-    # Financial Performance
     revenue = safe_format_currency(info.get("totalRevenue"))
     profit = safe_format_currency(info.get("netIncomeToCommon"))
 
-    # Shareholding extraction
     promoter = "51.4%"
     fii = "19.2%"
     dii = "16.8%"
