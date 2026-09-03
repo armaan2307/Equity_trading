@@ -18,12 +18,20 @@ app.add_middleware(
 
 DB_NAME = "trade_lifecycle.db"
 
-# Robust fallback pools to keep tables populated even after Render cold restarts
-FALLBACK_UNIVERSE = {
-    "intraday": ["TATAMOTORS", "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "BHARTIARTL", "LT", "AXISBANK", "MARUTI"],
-    "swing": ["TRENT", "BEL", "HAL", "CHOLAFIN", "MCX", "ZOMATO", "KALYANKJIL", "AMBER", "AEGISCHEM", "DLF"],
-    "longterm": ["LTIM", "TITAN", "SUNPHARMA", "TCS", "ASIANPAINT", "BAJFINANCE", "NTPC", "COALINDIA", "JIOFIN", "POWERGRID"]
-}
+@app.on_event("startup")
+def startup_screener():
+    # Pre-populate database on server boot if empty
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS intraday_trades (id INTEGER PRIMARY KEY, symbol TEXT)")
+        cursor.execute("SELECT COUNT(*) FROM intraday_trades")
+        count = cursor.fetchone()[0]
+        conn.close()
+        if count == 0:
+            screener_engine.run_screener()
+    except Exception:
+        pass
 
 @app.get("/api/indices")
 def get_indices():
@@ -65,90 +73,57 @@ def get_indices():
 
 @app.get("/api/trades/{timeframe}")
 def get_trades(timeframe: str):
-    tf = timeframe.lower().strip()
     table_map = {
         "intraday": "intraday_trades",
         "swing": "swing_trades",
         "longterm": "longterm_trades"
     }
-    table = table_map.get(tf)
+    table = table_map.get(timeframe.lower().strip())
     if not table:
         raise HTTPException(status_code=404, detail="Invalid timeframe specified.")
 
-    records = []
-    
-    # 1. Read from SQLite if data exists
+    conn = sqlite3.connect(DB_NAME)
     try:
-        conn = sqlite3.connect(DB_NAME)
         df = pd.read_sql(f"SELECT * FROM {table} WHERE status = 'ACTIVE' LIMIT 10", conn)
-        conn.close()
-        if not df.empty:
-            for col in ["category", "rsi"]:
-                if col in df.columns:
-                    df = df.drop(columns=[col])
-            records = df.to_dict(orient="records")
     except Exception:
-        records = []
+        df = pd.DataFrame()
+    finally:
+        conn.close()
 
-    # 2. Live On-the-Fly Generator if SQLite is empty
-    if not records:
-        symbols = FALLBACK_UNIVERSE.get(tf, FALLBACK_UNIVERSE["intraday"])
-        symbols_ns = [f"{s}.NS" for s in symbols]
+    if df.empty:
+        # Run screener if not yet populated
+        screener_engine.run_screener()
+        conn = sqlite3.connect(DB_NAME)
         try:
-            batch = yf.download(symbols_ns, period="5d", interval="1d", group_by="ticker", progress=False, threads=True)
+            df = pd.read_sql(f"SELECT * FROM {table} WHERE status = 'ACTIVE' LIMIT 10", conn)
         except Exception:
-            batch = None
+            df = pd.DataFrame()
+        finally:
+            conn.close()
 
-        for sym in symbols:
-            try:
-                df_sym = batch[f"{sym}.NS"] if batch is not None and f"{sym}.NS" in batch else yf.Ticker(f"{sym}.NS").history(period="5d", interval="1d")
-                df_sym = df_sym.dropna()
-                cmp_val = round(float(df_sym['Close'].iloc[-1]), 2)
-                high = float(df_sym['High'].iloc[-1])
-                low = float(df_sym['Low'].iloc[-1])
-                vol = (high - low) if (high - low) > 0 else (cmp_val * 0.015)
-            except Exception:
-                continue
+    if df.empty:
+        return []
 
-            if tf == "intraday":
-                entry = round(cmp_val * 0.998, 2)
-                target = round(cmp_val + (1.5 * vol), 2)
-                stop_loss = round(cmp_val - (1.0 * vol), 2)
-            elif tf == "swing":
-                entry = round(cmp_val * 0.992, 2)
-                target = round(cmp_val + (3.0 * vol), 2)
-                stop_loss = round(cmp_val - (1.8 * vol), 2)
-            else:
-                entry = round(cmp_val * 0.985, 2)
-                target = round(cmp_val * 1.25, 2)
-                stop_loss = round(cmp_val * 0.90, 2)
+    for col in ["category", "rsi"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
 
-            ret = round(((cmp_val - entry) / entry) * 100, 2)
-            records.append({
-                "symbol": sym,
-                "entry": entry,
-                "current_price": cmp_val,
-                "target": target,
-                "stop_loss": stop_loss,
-                "return_pct": ret
-            })
-        return records[:10]
-
-    # 3. Synchronize DB records with fast live quotes
+    records = df.to_dict(orient="records")
     for row in records:
         sym = row.get("symbol")
         if sym:
             sym_ticker = f"{sym}.NS" if not sym.endswith(".NS") else sym
             try:
                 t = yf.Ticker(sym_ticker)
-                cmp_val = t.fast_info.get("lastPrice")
-                if not cmp_val:
+                cmp = t.fast_info.get("lastPrice")
+                if not cmp:
                     hist = t.history(period="1d")
-                    cmp_val = float(hist['Close'].iloc[-1]) if not hist.empty else row.get("entry", 0)
-                row["current_price"] = round(float(cmp_val), 2)
+                    cmp = float(hist['Close'].iloc[-1]) if not hist.empty else row.get("entry", 0)
+                
+                row["current_price"] = round(float(cmp), 2)
                 entry = float(row.get("entry", 0))
                 if entry > 0:
-                    row["return_pct"] = round(((float(cmp_val) - entry) / entry) * 100, 2)
+                    row["return_pct"] = round(((float(cmp) - entry) / entry) * 100, 2)
             except Exception:
                 row["current_price"] = row.get("entry", 0)
 
